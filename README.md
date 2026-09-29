@@ -146,6 +146,8 @@ Examples:
 /codex:rescue fix the failing test with the smallest safe patch
 /codex:rescue --resume apply the top fix from the last run
 /codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
+/codex:rescue --effort max investigate the regression
+/codex:rescue --effort ultra investigate the intermittent deadlock
 /codex:rescue --model spark fix the issue quickly
 /codex:rescue --background investigate the regression
 ```
@@ -159,6 +161,7 @@ Ask Codex to redesign the database connection to be more resilient.
 **Notes:**
 
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
+- `--effort` forwards the requested level to Codex, including `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. Supported levels depend on the model and Codex version; Codex validates support. The plugin does not maintain a fixed allowlist. See the [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
 
@@ -284,6 +287,8 @@ Your configuration will be picked up based on:
 - project-level overrides only load when the [project is trusted](https://developers.openai.com/codex/config-advanced#project-config-files-codexconfigtoml)
 
 Check out the Codex docs for more [configuration options](https://developers.openai.com/codex/config-reference).
+
+The plugin's app-server integration is type-checked against Codex CLI `0.159.0`. Update your local CLI with `npm install -g @openai/codex@latest` to use current model and effort capabilities.
 
 ### Moving The Work Over To Codex
 

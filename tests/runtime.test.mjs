@@ -732,7 +732,7 @@ test("task --resume acts like --resume-last without leaking the flag into the pr
   });
   assert.equal(firstRun.status, 0, firstRun.stderr);
 
-  const result = run("node", [SCRIPT, "task", "--resume", "follow up"], {
+  const result = run("node", [SCRIPT, "task", "--resume", "--effort", "max", "follow up"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -741,6 +741,7 @@ test("task --resume acts like --resume-last without leaking the flag into the pr
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
   assert.equal(fakeState.lastTurnStart.prompt, "follow up");
+  assert.equal(fakeState.lastTurnStart.effort, "max");
 });
 
 test("task --fresh is treated as routing control and does not leak into the prompt", () => {
@@ -782,6 +783,42 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastTurnStart.model, "gpt-5.3-codex-spark");
   assert.equal(fakeState.lastTurnStart.effort, "low");
+});
+
+for (const effort of ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", " ULTRA "]) {
+  test(`task forwards reasoning effort ${JSON.stringify(effort)} without changing the prompt`, () => {
+    const repo = makeTempDir();
+    const binDir = makeTempDir();
+    installFakeCodex(binDir);
+    initGitRepo(repo);
+
+    const result = run("node", [SCRIPT, "task", "--effort", effort, "diagnose the failing test"], {
+      cwd: repo,
+      env: buildEnv(binDir)
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+    assert.equal(fakeState.lastTurnStart.effort, effort.trim().toLowerCase());
+    assert.equal(fakeState.lastTurnStart.model, null);
+    assert.equal(fakeState.lastTurnStart.prompt, "diagnose the failing test");
+  });
+}
+
+test("task leaves reasoning effort unset when omitted", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "diagnose the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.lastTurnStart.effort, null);
 });
 
 test("task logs reasoning summaries and assistant messages to the job log", () => {
@@ -929,7 +966,7 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the failing test"], {
+  const launched = run("node", [SCRIPT, "task", "--background", "--effort", "ultra", "--json", "investigate the failing test"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -967,6 +1004,9 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.equal(resultPayload.job.id, launchPayload.jobId);
   assert.equal(resultPayload.job.status, "completed");
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.lastTurnStart.effort, "ultra");
+  assert.equal(fakeState.lastTurnStart.prompt, "investigate the failing test");
 });
 
 test("review rejects focus text because it is native-review only", () => {
