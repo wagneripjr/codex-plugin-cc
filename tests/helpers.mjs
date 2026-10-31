@@ -4,6 +4,9 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
+delete process.env.CLAUDE_PLUGIN_DATA;
+delete process.env.CODEX_COMPANION_SESSION_ID;
+
 export function makeTempDir(prefix = "codex-plugin-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
