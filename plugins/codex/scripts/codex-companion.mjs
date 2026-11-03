@@ -68,6 +68,8 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
+const DEFAULT_FOREGROUND_MAX_WAIT_MS = 540000;
+const FOREGROUND_POLL_INTERVAL_MS = 250;
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
@@ -76,12 +78,13 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
-      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <effort>] [prompt]",
+      "  node scripts/codex-companion.mjs review [--wait|--background] [--max-wait-ms <n>] [--base <ref>] [--scope <auto|working-tree|branch>]",
+      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--max-wait-ms <n>] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs task [--wait|--background] [--max-wait-ms <n>] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <effort>] [prompt]",
+      "    Without --background, waits at most --max-wait-ms (default 540000) and then prints the job id to continue with status --wait.",
       "    Effort is model-dependent (e.g. none, minimal, low, medium, high, xhigh, max, ultra); Codex validates support.",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
-      "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
+      "  node scripts/codex-companion.mjs status [job-id] [--all] [--wait] [--timeout-ms <n>] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
     ].join("\n")
@@ -659,6 +662,49 @@ async function runForegroundCommand(job, runner, options = {}) {
   return execution;
 }
 
+function parseMaxWaitMs(value) {
+  if (value == null) {
+    return DEFAULT_FOREGROUND_MAX_WAIT_MS;
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`--max-wait-ms must be a positive integer number of milliseconds, got "${value}".`);
+  }
+  return parsed;
+}
+
+function renderStillRunningLine(jobId, maxWaitMs) {
+  return `codex: job ${jobId} still running after ${maxWaitMs} ms; continue with: status ${jobId} --wait --timeout-ms ${maxWaitMs}`;
+}
+
+async function runBoundedForeground(cwd, job, request, options) {
+  const maxWaitMs = parseMaxWaitMs(options["max-wait-ms"]);
+  const { payload } = enqueueBackgroundTask(cwd, job, request);
+  const snapshot = await waitForSingleJobSnapshot(cwd, job.id, {
+    timeoutMs: maxWaitMs,
+    pollIntervalMs: FOREGROUND_POLL_INTERVAL_MS
+  });
+
+  if (snapshot.waitTimedOut) {
+    outputCommandResult(
+      { ...payload, status: snapshot.job.status, stillRunning: true, maxWaitMs },
+      `${renderQueuedTaskLaunch(payload)}${renderStillRunningLine(job.id, maxWaitMs)}\n`,
+      options.json
+    );
+    return;
+  }
+
+  const storedJob = readStoredJob(snapshot.workspaceRoot, job.id);
+  if (!storedJob?.result) {
+    throw new Error(storedJob?.errorMessage ?? `Codex job ${job.id} ended as ${snapshot.job.status} without a result.`);
+  }
+  outputCommandResult(storedJob.result, storedJob.rendered, options.json);
+  const exitStatus = storedJob.exitStatus ?? (snapshot.job.status === "completed" ? 0 : 1);
+  if (exitStatus !== 0) {
+    process.exitCode = exitStatus;
+  }
+}
+
 function spawnDetachedTaskWorker(cwd, jobId) {
   const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
   const child = spawn(process.execPath, [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId], {
@@ -676,17 +722,20 @@ function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+  const child = spawnDetachedTaskWorker(cwd, job.id);
+  if (child.pid) {
+    upsertJob(job.workspaceRoot, { id: job.id, pid: child.pid });
+  }
 
   return {
     payload: {
@@ -702,7 +751,7 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "cwd", "max-wait-ms"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
@@ -727,20 +776,21 @@ async function handleReviewCommand(argv, config) {
     jobClass: "review",
     summary: metadata.summary
   });
-  await runForegroundCommand(
-    job,
-    (progress) =>
-      executeReviewRun({
-        cwd,
-        base: options.base,
-        scope: options.scope,
-        model: options.model,
-        focusText,
-        reviewName: config.reviewName,
-        onProgress: progress
-      }),
-    { json: options.json }
-  );
+  const request = {
+    cwd,
+    base: options.base,
+    scope: options.scope,
+    model: options.model,
+    focusText,
+    reviewName: config.reviewName
+  };
+  if (options.background) {
+    await runForegroundCommand(job, (progress) => executeReviewRun({ ...request, onProgress: progress }), {
+      json: options.json
+    });
+    return;
+  }
+  await runBoundedForeground(cwd, job, request, options);
 }
 
 async function handleReview(argv) {
@@ -752,8 +802,8 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "max-wait-ms"],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "wait"],
     aliasMap: {
       m: "model"
     }
@@ -776,41 +826,25 @@ async function handleTask(argv) {
     resumeLast
   });
 
-  if (options.background) {
-    ensureCodexAvailable(cwd);
-    requireTaskRequest(prompt, resumeLast);
+  ensureCodexAvailable(cwd);
+  requireTaskRequest(prompt, resumeLast);
 
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write);
-    const request = buildTaskRequest({
-      cwd,
-      model,
-      effort,
-      prompt,
-      write,
-      resumeLast,
-      jobId: job.id
-    });
+  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+  const request = buildTaskRequest({
+    cwd,
+    model,
+    effort,
+    prompt,
+    write,
+    resumeLast,
+    jobId: job.id
+  });
+  if (options.background) {
     const { payload } = enqueueBackgroundTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
-
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
-  await runForegroundCommand(
-    job,
-    (progress) =>
-      executeTaskRun({
-        cwd,
-        model,
-        effort,
-        prompt,
-        write,
-        resumeLast,
-        jobId: job.id,
-        onProgress: progress
-      }),
-    { json: options.json }
-  );
+  await runBoundedForeground(cwd, job, request, options);
 }
 
 async function handleTransfer(argv) {
@@ -846,6 +880,7 @@ async function handleTaskWorker(argv) {
   if (!request || typeof request !== "object") {
     throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
   }
+  const execute = storedJob.jobClass === "review" ? executeReviewRun : executeTaskRun;
 
   const { logFile, progress } = createTrackedProgress(
     {
@@ -863,7 +898,7 @@ async function handleTaskWorker(argv) {
       logFile
     },
     () =>
-      executeTaskRun({
+      execute({
         ...request,
         onProgress: progress
       }),

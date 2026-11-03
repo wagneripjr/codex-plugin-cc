@@ -14,6 +14,7 @@ import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const STOP_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
+const STOP_REVIEW_MAX_WAIT_MS = STOP_REVIEW_TIMEOUT_MS - 30 * 1000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -102,7 +103,7 @@ function runStopReview(cwd, input = {}) {
     ...process.env,
     ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
   };
-  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", prompt], {
+  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", "--max-wait-ms", String(STOP_REVIEW_MAX_WAIT_MS), prompt], {
     cwd,
     env: childEnv,
     encoding: "utf8",
@@ -129,6 +130,12 @@ function runStopReview(cwd, input = {}) {
 
   try {
     const payload = JSON.parse(result.stdout);
+    if (payload?.stillRunning) {
+      return {
+        ok: false,
+        reason: `The stop-time Codex review task is still running as ${payload.jobId} after ${payload.maxWaitMs} ms. Check /codex:status ${payload.jobId} or bypass the gate.`
+      };
+    }
     return parseStopReviewOutput(payload?.rawOutput);
   } catch {
     return {

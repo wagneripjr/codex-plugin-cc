@@ -413,7 +413,10 @@ rl.on("line", (line) => {
         }
         const turnId = nextTurnId(state);
         send({ id: message.id, result: { turn: buildTurn(turnId), reviewThreadId: reviewThread.id } });
-        emitTurnCompleted(reviewThread.id, turnId, [
+        const completeReview = BEHAVIOR === "slow-task"
+          ? (threadId, completedTurnId, items) => emitTurnCompletedLater(threadId, completedTurnId, items, 400)
+          : emitTurnCompleted;
+        completeReview(reviewThread.id, turnId, [
           {
             started: { type: "enteredReviewMode", id: turnId, review: "current changes" }
           },

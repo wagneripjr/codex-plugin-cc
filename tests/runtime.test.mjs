@@ -2301,3 +2301,107 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
 });
+
+const RESCUE_AGENT = path.join(PLUGIN_ROOT, "agents", "codex-rescue.md");
+const STILL_RUNNING_LINE = /^codex: job (\S+) still running after (\d+) ms; continue with: status \1 --wait --timeout-ms \2$/;
+
+function makeDirtyRepo(behavior) {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, behavior);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+  return { repo, binDir, env: buildEnv(binDir) };
+}
+
+function lastStdoutLine(result) {
+  return result.stdout.trimEnd().split("\n").at(-1);
+}
+
+const BOUNDED_FOREGROUND_COMMANDS = [
+  { name: "task", args: ["task", "investigate the failing test"], jobId: /^task-/, output: /Handled the requested task/ },
+  { name: "review", args: ["review"], jobId: /^review-/, output: /No material issues found/ },
+  { name: "adversarial-review", args: ["adversarial-review"], jobId: /^review-/, output: /Missing empty-state guard/ }
+];
+
+for (const command of BOUNDED_FOREGROUND_COMMANDS) {
+  test(`${command.name} outlasting --max-wait-ms exits 0 naming a job that status --wait and result finish`, () => {
+    const { repo, env } = makeDirtyRepo("slow-task");
+
+    const launched = run("node", [SCRIPT, ...command.args, "--max-wait-ms", "100"], { cwd: repo, env });
+
+    assert.equal(launched.status, 0, launched.stderr);
+    const match = lastStdoutLine(launched).match(STILL_RUNNING_LINE);
+    assert.ok(match, launched.stdout);
+    const [, jobId, maxWaitMs] = match;
+    assert.match(jobId, command.jobId);
+    assert.equal(maxWaitMs, "100");
+    assert.match(launched.stdout, new RegExp(`started in the background as ${jobId}\\.`));
+
+    const waited = run("node", [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "15000", "--json"], { cwd: repo, env });
+    assert.equal(waited.status, 0, waited.stderr);
+    assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+
+    const result = run("node", [SCRIPT, "result", jobId], { cwd: repo, env });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, command.output);
+  });
+
+  test(`${command.name} finishing inside --max-wait-ms prints its result and no job hand-off`, () => {
+    const { repo, env } = makeDirtyRepo("slow-task");
+
+    const finished = run("node", [SCRIPT, ...command.args, "--max-wait-ms", "15000"], { cwd: repo, env });
+
+    assert.equal(finished.status, 0, finished.stderr);
+    assert.match(finished.stdout, command.output);
+    assert.doesNotMatch(finished.stdout, /still running|started in the background/);
+  });
+}
+
+test("task --json outlasting --max-wait-ms returns the queued payload marked stillRunning", () => {
+  const { repo, env } = makeDirtyRepo("slow-task");
+
+  const launched = run("node", [SCRIPT, "task", "--json", "--max-wait-ms", "100", "investigate"], { cwd: repo, env });
+
+  assert.equal(launched.status, 0, launched.stderr);
+  const payload = JSON.parse(launched.stdout);
+  assert.equal(payload.stillRunning, true);
+  assert.equal(payload.maxWaitMs, 100);
+  assert.match(payload.jobId, /^task-/);
+  const waited = run("node", [SCRIPT, "status", payload.jobId, "--wait", "--timeout-ms", "15000", "--json"], { cwd: repo, env });
+  assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+});
+
+test("the runtime's still-running line is the line codex-rescue is told to match", () => {
+  const { repo, env } = makeDirtyRepo("slow-task");
+
+  const launched = run("node", [SCRIPT, "task", "--max-wait-ms", "100", "investigate"], { cwd: repo, env });
+
+  const line = lastStdoutLine(launched);
+  const [, jobId, maxWaitMs] = line.match(STILL_RUNNING_LINE);
+  const template = line.replaceAll(jobId, "<jobId>").replaceAll(maxWaitMs, "<n>");
+  assert.ok(fs.readFileSync(RESCUE_AGENT, "utf8").includes(`\`${template}\``), template);
+  run("node", [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "15000"], { cwd: repo, env });
+});
+
+test("task accepts --wait as a routing flag without leaking it into the prompt", () => {
+  const { repo, binDir, env } = makeDirtyRepo();
+
+  const result = run("node", [SCRIPT, "task", "--wait", "investigate the failing test"], { cwd: repo, env });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.lastTurnStart.prompt, "investigate the failing test");
+});
+
+test("--max-wait-ms rejects a non-positive bound before any job starts", () => {
+  const { repo, env } = makeDirtyRepo();
+
+  const result = run("node", [SCRIPT, "review", "--max-wait-ms", "0"], { cwd: repo, env });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--max-wait-ms must be a positive integer/);
+});

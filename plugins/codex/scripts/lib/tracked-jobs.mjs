@@ -163,6 +163,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       pid: null,
       phase: completionStatus === "completed" ? "done" : "failed",
       completedAt,
+      exitStatus: execution.exitStatus,
       result: execution.payload,
       rendered: execution.rendered
     });
