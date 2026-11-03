@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.1
+
+- `codex:codex-rescue` always runs `task` in the foreground and no longer picks `--background` on its own for long tasks, so it never returns a bare job id.
+
 ## 1.1.0
 
 - Bound foreground `task`, `review` and `adversarial-review` with `--max-wait-ms` (default 540000, under Claude Code's 600 s foreground Bash cap). The run executes in the detached worker; a job still active at the bound exits 0 with a stable last line naming the job id and the `status <jobId> --wait --timeout-ms <n>` continuation.
